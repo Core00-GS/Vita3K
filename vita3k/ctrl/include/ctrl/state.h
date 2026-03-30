@@ -22,6 +22,7 @@
 #include <SDL3/SDL_gamepad.h>
 #include <SDL3/SDL_haptic.h>
 
+#include <atomic>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -72,4 +73,14 @@ struct CtrlState {
     uint64_t last_vcount[5] = {}; // sceCtrl ports.
 
     VirtualKeyboardState keyboard_state;
+
+    std::atomic<bool> overlay_input_intercepted{ false };
+    bool ignore_input = false;
+
+    struct OverlayMouseState {
+        std::atomic<float> x{ 0.f };
+        std::atomic<float> y{ 0.f };
+        std::atomic<bool> pressed{ false };
+    };
+    OverlayMouseState overlay_mouse;
 };

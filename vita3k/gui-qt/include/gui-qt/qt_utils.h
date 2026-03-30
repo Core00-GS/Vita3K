@@ -16,11 +16,28 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #pragma once
-#include <emuenv/state.h>
-#include <lang/state.h>
 
-namespace lang {
+#include <QColor>
+#include <QIcon>
+#include <QPixmap>
 
-void init_lang(LangState &lang, EmuEnvState &emuenv);
+#include <map>
+#include <string>
 
-} // namespace lang
+namespace gui::utils {
+
+void open_dir(const std::string &path);
+
+QColor get_foreground_color(QWidget *widget = nullptr);
+
+QIcon get_colorized_icon(const QIcon &icon,
+    const QColor &source_color,
+    const std::map<QIcon::Mode, QColor> &new_colors);
+
+bool dark_mode_active();
+
+QColor get_label_color(
+    const QColor &fallback_light,
+    const QColor &fallback_dark);
+
+} // namespace gui::utils

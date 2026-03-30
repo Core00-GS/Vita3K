@@ -17,8 +17,6 @@
 
 #pragma once
 
-#include <compat/state.h>
-
 #include <cstdint>
 #include <map>
 #include <mutex>

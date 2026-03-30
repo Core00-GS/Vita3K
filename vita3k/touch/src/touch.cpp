@@ -15,7 +15,7 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
-#include <dialog/state.h>
+#include <ctrl/state.h>
 #include <display/functions.h>
 #include <display/state.h>
 #include <emuenv/state.h>
@@ -25,10 +25,6 @@
 #include <touch/touch.h>
 
 #include <SDL3/SDL_events.h>
-
-#ifdef _WIN32
-#include <Windows.h>
-#endif
 
 #include <cstring>
 
@@ -139,25 +135,10 @@ void touch_vsync_update(const EmuEnvState &emuenv) {
     } else {
         const auto &ts = emuenv.touch;
 
-        float mouse_x, mouse_y;
-        bool left, right;
-#ifdef _WIN32
-        {
-            POINT pt;
-            GetCursorPos(&pt);
-            if (ts.native_handle)
-                ScreenToClient(reinterpret_cast<HWND>(ts.native_handle), &pt);
-            mouse_x = static_cast<float>(pt.x);
-            mouse_y = static_cast<float>(pt.y);
-            left = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-            right = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
-        }
-#else
-        mouse_x = ts.mouse_x;
-        mouse_y = ts.mouse_y;
-        left = ts.mouse_button_left;
-        right = ts.mouse_button_right;
-#endif
+        float mouse_x = ts.mouse_x;
+        float mouse_y = ts.mouse_y;
+        bool left = ts.mouse_button_left;
+        bool right = ts.mouse_button_right;
         left = left || pinchModifierEnabled;
 
         for (int port = 0; port < 2; port++) {
@@ -346,8 +327,7 @@ int toggle_touchscreen() {
 
 int touch_get(const SceUID thread_id, EmuEnvState &emuenv, const SceUInt32 &port, SceTouchData *pData, SceUInt32 count, bool is_peek) {
     memset(pData, 0, sizeof(SceTouchData) * count);
-    // issue if common dialog is LLEd?
-    if (emuenv.drop_inputs || emuenv.common_dialog.status == SCE_COMMON_DIALOG_STATUS_RUNNING)
+    if (emuenv.drop_inputs || emuenv.ctrl.overlay_input_intercepted.load(std::memory_order_relaxed))
         return 0;
 
     const int port_idx = static_cast<int>(port);

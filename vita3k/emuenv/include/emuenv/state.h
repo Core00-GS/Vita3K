@@ -32,6 +32,7 @@ struct SfoAppInfo;
 namespace renderer {
 enum class Backend : uint32_t;
 struct State;
+struct VulkanDeviceInfo;
 } // namespace renderer
 
 namespace ngs {
@@ -62,6 +63,10 @@ struct SfoFile;
 struct GDBState;
 struct HTTPState;
 struct CameraState;
+
+namespace overlay {
+class display_manager;
+}
 
 typedef float SceFloat;
 struct FVector2 {
@@ -140,6 +145,7 @@ public:
     uint32_t ms_per_frame = 0;
     renderer::Backend backend_renderer{};
     RendererPtr renderer{};
+    std::unique_ptr<renderer::VulkanDeviceInfo> vulkan_device_info;
     bool drop_inputs{};
     MemState &mem;
     CtrlState &ctrl;
@@ -170,6 +176,8 @@ public:
     CompatState &compat;
     int max_font_level = 0;
     int current_font_level = 0;
+
+    std::unique_ptr<overlay::display_manager> overlay_manager;
 
     Root get_root_paths() const {
         Root r;

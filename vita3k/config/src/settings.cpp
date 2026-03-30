@@ -79,6 +79,9 @@ bool load_custom_config(Config::CurrentConfig &out, const fs::path &config_path,
         out.export_textures = gpu.attribute("export-textures").as_bool();
         out.export_as_png = gpu.attribute("export-as-png").as_bool();
         out.fps_hack = gpu.attribute("fps-hack").as_bool();
+        out.shader_cache = gpu.attribute("shader-cache").as_bool(true);
+        out.spirv_shader = gpu.attribute("spirv-shader").as_bool();
+        out.texture_cache = gpu.attribute("texture-cache").as_bool(true);
     }
 
     if (!config_child.child("audio").empty()) {
@@ -88,13 +91,33 @@ bool load_custom_config(Config::CurrentConfig &out, const fs::path &config_path,
         out.ngs_enable = audio.attribute("enable-ngs").as_bool();
     }
 
-    if (!config_child.child("system").empty())
-        out.pstv_mode = config_child.child("system").attribute("pstv-mode").as_bool();
+    if (!config_child.child("system").empty()) {
+        const auto sys = config_child.child("system");
+        out.pstv_mode = sys.attribute("pstv-mode").as_bool();
+        out.sys_button = sys.attribute("sys-button").as_int(static_cast<int>(SCE_SYSTEM_PARAM_ENTER_BUTTON_CROSS));
+        out.sys_lang = sys.attribute("sys-lang").as_int(static_cast<int>(SCE_SYSTEM_PARAM_LANG_ENGLISH_US));
+        out.sys_date_format = sys.attribute("sys-date-format").as_int(static_cast<int>(SCE_SYSTEM_PARAM_DATE_FORMAT_MMDDYYYY));
+        out.sys_time_format = sys.attribute("sys-time-format").as_int(static_cast<int>(SCE_SYSTEM_PARAM_TIME_FORMAT_12HOUR));
+        out.ime_langs.clear();
+        for (const auto &lang : sys.child("ime-langs"))
+            out.ime_langs.push_back(std::stoull(lang.text().as_string()));
+        if (out.ime_langs.empty())
+            out.ime_langs.push_back(4);
+    }
 
     if (!config_child.child("emulator").empty()) {
         const auto emu = config_child.child("emulator");
-        out.show_touchpad_cursor = emu.attribute("show-touchpad-cursor").as_bool();
         out.file_loading_delay = emu.attribute("file-loading-delay").as_int();
+        out.stretch_the_display_area = emu.attribute("stretch-the-display-area").as_bool();
+        out.fullscreen_hd_res_pixel_perfect = emu.attribute("fullscreen-hd-res-pixel-perfect").as_bool();
+    }
+
+    if (!config_child.child("debug").empty()) {
+        const auto dbg = config_child.child("debug");
+        out.log_active_shaders = dbg.attribute("log-active-shaders").as_bool();
+        out.log_uniforms = dbg.attribute("log-uniforms").as_bool();
+        out.color_surface_debug = dbg.attribute("color-surface-debug").as_bool();
+        out.validation_layer = dbg.attribute("validation-layer").as_bool(true);
     }
 
     if (!config_child.child("network").empty())
@@ -143,6 +166,9 @@ bool save_custom_config(const Config::CurrentConfig &cc, const fs::path &config_
     gpu_child.append_attribute("export-textures") = cc.export_textures;
     gpu_child.append_attribute("export-as-png") = cc.export_as_png;
     gpu_child.append_attribute("fps-hack") = cc.fps_hack;
+    gpu_child.append_attribute("shader-cache") = cc.shader_cache;
+    gpu_child.append_attribute("spirv-shader") = cc.spirv_shader;
+    gpu_child.append_attribute("texture-cache") = cc.texture_cache;
 
     auto audio_child = config_child.append_child("audio");
     audio_child.append_attribute("audio-backend") = cc.audio_backend.c_str();
@@ -151,10 +177,24 @@ bool save_custom_config(const Config::CurrentConfig &cc, const fs::path &config_
 
     auto system_child = config_child.append_child("system");
     system_child.append_attribute("pstv-mode") = cc.pstv_mode;
+    system_child.append_attribute("sys-button") = cc.sys_button;
+    system_child.append_attribute("sys-lang") = cc.sys_lang;
+    system_child.append_attribute("sys-date-format") = cc.sys_date_format;
+    system_child.append_attribute("sys-time-format") = cc.sys_time_format;
+    auto ime_child = system_child.append_child("ime-langs");
+    for (const auto &lang : cc.ime_langs)
+        ime_child.append_child("lang").append_child(pugi::node_pcdata).set_value(std::to_string(lang).c_str());
 
     auto emu_child = config_child.append_child("emulator");
-    emu_child.append_attribute("show-touchpad-cursor") = cc.show_touchpad_cursor;
     emu_child.append_attribute("file-loading-delay") = cc.file_loading_delay;
+    emu_child.append_attribute("stretch-the-display-area") = cc.stretch_the_display_area;
+    emu_child.append_attribute("fullscreen-hd-res-pixel-perfect") = cc.fullscreen_hd_res_pixel_perfect;
+
+    auto debug_child = config_child.append_child("debug");
+    debug_child.append_attribute("log-active-shaders") = cc.log_active_shaders;
+    debug_child.append_attribute("log-uniforms") = cc.log_uniforms;
+    debug_child.append_attribute("color-surface-debug") = cc.color_surface_debug;
+    debug_child.append_attribute("validation-layer") = cc.validation_layer;
 
     auto network_child = config_child.append_child("network");
     network_child.append_attribute("psn-signed-in") = cc.psn_signed_in;
@@ -211,12 +251,26 @@ void set_current_config(Config &cfg, const fs::path &config_path, const std::str
     cc.export_textures = cfg.export_textures;
     cc.export_as_png = cfg.export_as_png;
     cc.fps_hack = cfg.fps_hack;
+    cc.shader_cache = cfg.shader_cache;
+    cc.spirv_shader = cfg.spirv_shader;
+    cc.texture_cache = cfg.texture_cache;
     cc.audio_backend = cfg.audio_backend;
     cc.audio_volume = cfg.audio_volume;
     cc.ngs_enable = cfg.ngs_enable;
     cc.pstv_mode = cfg.pstv_mode;
+    cc.stretch_the_display_area = cfg.stretch_the_display_area;
+    cc.fullscreen_hd_res_pixel_perfect = cfg.fullscreen_hd_res_pixel_perfect;
     cc.file_loading_delay = cfg.file_loading_delay;
     cc.psn_signed_in = cfg.psn_signed_in;
+    cc.sys_button = cfg.sys_button;
+    cc.sys_lang = cfg.sys_lang;
+    cc.sys_date_format = cfg.sys_date_format;
+    cc.sys_time_format = cfg.sys_time_format;
+    cc.ime_langs = cfg.ime_langs;
+    cc.log_active_shaders = cfg.log_active_shaders;
+    cc.log_uniforms = cfg.log_uniforms;
+    cc.color_surface_debug = cfg.color_surface_debug;
+    cc.validation_layer = cfg.validation_layer;
 }
 
 void copy_current_config_to_global(Config &cfg) {
@@ -240,12 +294,26 @@ void copy_current_config_to_global(Config &cfg) {
     cfg.export_textures = cc.export_textures;
     cfg.export_as_png = cc.export_as_png;
     cfg.fps_hack = cc.fps_hack;
+    cfg.shader_cache = cc.shader_cache;
+    cfg.spirv_shader = cc.spirv_shader;
+    cfg.texture_cache = cc.texture_cache;
     cfg.audio_backend = cc.audio_backend;
     cfg.audio_volume = cc.audio_volume;
     cfg.ngs_enable = cc.ngs_enable;
     cfg.pstv_mode = cc.pstv_mode;
+    cfg.stretch_the_display_area = cc.stretch_the_display_area;
+    cfg.fullscreen_hd_res_pixel_perfect = cc.fullscreen_hd_res_pixel_perfect;
     cfg.file_loading_delay = cc.file_loading_delay;
     cfg.psn_signed_in = cc.psn_signed_in;
+    cfg.sys_button = cc.sys_button;
+    cfg.sys_lang = cc.sys_lang;
+    cfg.sys_date_format = cc.sys_date_format;
+    cfg.sys_time_format = cc.sys_time_format;
+    cfg.ime_langs = cc.ime_langs;
+    cfg.log_active_shaders = cc.log_active_shaders;
+    cfg.log_uniforms = cc.log_uniforms;
+    cfg.color_surface_debug = cc.color_surface_debug;
+    cfg.validation_layer = cc.validation_layer;
 }
 
 void save_current_config(Config &cfg, const fs::path &config_path, const std::string &app_path) {

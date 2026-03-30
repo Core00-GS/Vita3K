@@ -73,6 +73,19 @@ include_directories(${CMAKE_BINARY_DIR}/vita3k/config)
 
 if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
 	set(LINUX TRUE)
+
+	find_package(X11)
+	if(X11_FOUND)
+		add_compile_definitions(HAVE_X11)
+	endif()
+
+	find_package(PkgConfig)
+	if(PkgConfig_FOUND)
+		pkg_check_modules(WAYLAND wayland-client)
+		if(WAYLAND_FOUND)
+			add_compile_definitions(HAVE_WAYLAND)
+		endif()
+	endif()
 endif()
 
 get_boost()
@@ -90,6 +103,10 @@ if(NOT MSVC)
 	add_compile_options(-Wformat -Werror=format-security)
 endif()
 
+if(NOT ANDROID)
+	include(${CMAKE_SOURCE_DIR}/cmake/qt6.cmake)
+endif()
+
 add_subdirectory(app)
 add_subdirectory(audio)
 add_subdirectory(camera)
@@ -102,11 +119,12 @@ add_subdirectory(dialog)
 add_subdirectory(display)
 add_subdirectory(features)
 add_subdirectory(glutil)
-add_subdirectory(gui)
+if(NOT ANDROID)
+	add_subdirectory(gui-qt)
+endif()
 add_subdirectory(gxm)
 add_subdirectory(host)
 add_subdirectory(ime)
-add_subdirectory(lang)
 add_subdirectory(net)
 add_subdirectory(ngs)
 add_subdirectory(np)
@@ -114,12 +132,14 @@ add_subdirectory(emuenv)
 add_subdirectory(http)
 add_subdirectory(io)
 add_subdirectory(kernel)
+add_subdirectory(lang)
 add_subdirectory(mem)
 add_subdirectory(patch)
 add_subdirectory(module)
 add_subdirectory(modules)
 add_subdirectory(motion)
 add_subdirectory(nids)
+add_subdirectory(overlay)
 add_subdirectory(regmgr)
 add_subdirectory(renderer)
 add_subdirectory(rtc)
@@ -132,8 +152,8 @@ add_subdirectory(packages)
 add_subdirectory(vkutil)
 
 if(ANDROID)
-	add_library(vita3k SHARED main.cpp interface.cpp performance.cpp)
-	target_link_libraries(vita3k PRIVATE SDL3::SDL3 android)
+	add_library(vita3k SHARED android.cpp interface.cpp performance.cpp)
+	target_link_libraries(vita3k PRIVATE SDL3::SDL3 pugixml::pugixml android)
 
 	if(CMAKE_BUILD_TYPE STREQUAL "Release")
 		# we need to exclude all symbols except SDL
@@ -172,7 +192,10 @@ if(WIN32)
 	target_sources(vita3k PRIVATE util/src/vc_runtime_checker.cpp)
 endif()
 
-target_link_libraries(vita3k PRIVATE app audio config cppcommon ctrl display gdbstub gui gxm io miniz modules motion packages patch renderer shader touch util)
+target_link_libraries(vita3k PRIVATE app audio config cppcommon ctrl dialog display lang gdbstub gxm io miniz modules motion packages patch renderer shader touch util)
+if(NOT ANDROID)
+	target_link_libraries(vita3k PRIVATE gui-qt)
+endif()
 if(USE_DISCORD_RICH_PRESENCE)
 	target_link_libraries(vita3k PRIVATE discord-rpc)
 endif()
@@ -181,10 +204,13 @@ if(LINUX)
 	target_link_libraries(vita3k PRIVATE -static-libgcc -static-libstdc++)
 endif()
 
-set_target_properties(vita3k PROPERTIES OUTPUT_NAME Vita3K
-	ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-	LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-	RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+set_target_properties(vita3k PROPERTIES OUTPUT_NAME Vita3K)
+if(NOT ANDROID)
+	set_target_properties(vita3k PROPERTIES
+		ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+		LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+		RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+endif()
 
 if(APPLE)
 	add_custom_command(
@@ -241,6 +267,12 @@ if(APPLE)
 	message(STATUS "MoltenVK dylib path: ${MOLTENVK_DYLIB}")
 	target_sources(vita3k PRIVATE ${MOLTENVK_DYLIB})
 	set_source_files_properties(${MOLTENVK_DYLIB} PROPERTIES MACOSX_PACKAGE_LOCATION Frameworks)
+
+	qt_finalize_target(vita3k)
+	if(MACDEPLOYQT_EXECUTABLE)
+		add_custom_command(TARGET vita3k POST_BUILD
+			COMMAND "${MACDEPLOYQT_EXECUTABLE}" "$<TARGET_FILE_DIR:vita3k>/../.." "$<$<CONFIG:Debug,RelWithDebInfo>:-no-strip>")
+	endif()
 elseif(LINUX)
 	set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-rpath='$ORIGIN'")
 	if(BUILD_APPIMAGE)
@@ -251,7 +283,8 @@ elseif(LINUX)
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${APPDIR}/usr/share/Vita3K"
 		COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/../data" "${APPDIR}/usr/share/Vita3K/data"
 		COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/../lang" "${APPDIR}/usr/share/Vita3K/lang"
-		COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/shaders-builtin" "${APPDIR}/usr/share/Vita3K/shaders-builtin")
+		COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/shaders-builtin" "${APPDIR}/usr/share/Vita3K/shaders-builtin"
+		COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/icons" "${APPDIR}/usr/share/Vita3K/icons")
 		if(USE_VITA3K_UPDATE)
 			set(LINUXDEPLOY_WRAPPER "${CMAKE_SOURCE_DIR}/appimage/build_updater.sh")
 		else()
@@ -268,7 +301,7 @@ elseif(LINUX)
 		COMMAND ${LINUXDEPLOY_WRAPPER} ${LINUXDEPLOY_COMMAND} --appdir="${APPDIR}"
 			-e "$<TARGET_FILE:vita3k>" --icon-filename="vita3k"
 			-i "${CMAKE_CURRENT_SOURCE_DIR}/../data/image/icon.png" -d "${CMAKE_CURRENT_SOURCE_DIR}/../appimage/vita3k.desktop"
-			--custom-apprun="${CMAKE_CURRENT_SOURCE_DIR}/../appimage/apprun.sh" --output=appimage ${DISCORD_LIB_APPIMAGE}
+			--custom-apprun="${CMAKE_CURRENT_SOURCE_DIR}/../appimage/apprun.sh" --plugin qt --output=appimage ${DISCORD_LIB_APPIMAGE}
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_BINARY_DIR}/*.AppImage*" "$<TARGET_FILE_DIR:vita3k>/"
 		COMMAND ${CMAKE_COMMAND} -E rm "${CMAKE_CURRENT_BINARY_DIR}/*.AppImage*")
 	endif()
@@ -277,7 +310,8 @@ elseif(LINUX)
 	POST_BUILD
 	COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/../data" "$<TARGET_FILE_DIR:vita3k>/data"
 	COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/../lang" "$<TARGET_FILE_DIR:vita3k>/lang"
-	COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/shaders-builtin" "$<TARGET_FILE_DIR:vita3k>/shaders-builtin")
+	COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/shaders-builtin" "$<TARGET_FILE_DIR:vita3k>/shaders-builtin"
+	COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/icons" "$<TARGET_FILE_DIR:vita3k>/icons")
 	if(USE_VITA3K_UPDATE)
 		add_custom_command(
 		TARGET vita3k
@@ -294,13 +328,14 @@ elseif(WIN32)
 	target_link_libraries(vita3k PRIVATE Version)
 	target_sources(vita3k PRIVATE resource.h Vita3K.ico Vita3K.rc Windows.manifest)
 	set_property(DIRECTORY ${CMAKE_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT vita3k)
-	set_target_properties(vita3k PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$(Configuration)")
+	set_target_properties(vita3k PROPERTIES WIN32_EXECUTABLE TRUE VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$(Configuration)")
 	add_custom_command(
 		TARGET vita3k
 		POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/../data" "$<TARGET_FILE_DIR:vita3k>/data"
 		COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/../lang" "$<TARGET_FILE_DIR:vita3k>/lang"
-		COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/shaders-builtin" "$<TARGET_FILE_DIR:vita3k>/shaders-builtin")
+		COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/shaders-builtin" "$<TARGET_FILE_DIR:vita3k>/shaders-builtin"
+		COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/icons" "$<TARGET_FILE_DIR:vita3k>/icons")
 	if(USE_VITA3K_UPDATE)
 		add_custom_command(
 		TARGET vita3k
@@ -320,6 +355,14 @@ elseif(WIN32)
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${OPENSSL_ROOT_DIR}/bin/libssl-3-x64.dll" "$<TARGET_FILE_DIR:vita3k>"
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${OPENSSL_ROOT_DIR}/bin/libcrypto-3-x64.dll" "$<TARGET_FILE_DIR:vita3k>")
 	endif()
+	if(WINDEPLOYQT_EXECUTABLE)
+		add_custom_command(TARGET vita3k POST_BUILD
+			COMMAND "${WINDEPLOYQT_EXECUTABLE}" --no-compiler-runtime --no-opengl-sw --no-patchqt
+				--no-system-d3d-compiler --no-system-dxc-compiler
+				--plugindir "$<IF:$<CXX_COMPILER_ID:MSVC>,$<TARGET_FILE_DIR:vita3k>/plugins,$<TARGET_FILE_DIR:vita3k>/share/qt6/plugins>"
+				--translationdir "$<IF:$<CXX_COMPILER_ID:MSVC>,$<TARGET_FILE_DIR:vita3k>/translations,$<TARGET_FILE_DIR:vita3k>/share/qt6/translations>"
+				--verbose 0 "$<TARGET_FILE:vita3k>")
+	endif()
 elseif(ANDROID)
 	add_custom_command(
 		TARGET vita3k
@@ -327,6 +370,7 @@ elseif(ANDROID)
 		COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/../data" "${CMAKE_CURRENT_SOURCE_DIR}/../android/assets/data"
 		COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/../lang" "${CMAKE_CURRENT_SOURCE_DIR}/../android/assets/lang"
 		COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/shaders-builtin" "${CMAKE_CURRENT_SOURCE_DIR}/../android/assets/shaders-builtin"
+		COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/icons" "${CMAKE_CURRENT_SOURCE_DIR}/../android/assets/icons"
 	)
 endif()
 

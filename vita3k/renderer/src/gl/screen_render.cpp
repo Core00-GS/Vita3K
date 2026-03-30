@@ -253,6 +253,9 @@ void ScreenRenderer::destroy() {
 
     glDeleteTextures(1, &m_screen_texture);
     m_screen_texture = 0;
+
+    m_render_shader_nofilter.reset();
+    m_render_shader_fxaa.reset();
 }
 
 ScreenRenderer::~ScreenRenderer() {

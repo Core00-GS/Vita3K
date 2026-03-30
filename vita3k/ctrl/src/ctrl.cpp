@@ -20,7 +20,6 @@
 #include <ctrl/state.h>
 
 #include <config/state.h>
-#include <dialog/state.h>
 #include <display/functions.h>
 #include <display/state.h>
 #include <kernel/state.h>
@@ -310,7 +309,7 @@ static void retrieve_ctrl_data(EmuEnvState &emuenv, int port, bool is_v2, bool n
             buttons ^= ~0;
     };
 
-    if ((emuenv.common_dialog.status == SCE_COMMON_DIALOG_STATUS_RUNNING) || emuenv.drop_inputs) {
+    if (state.overlay_input_intercepted.load(std::memory_order_relaxed) || emuenv.drop_inputs) {
         reset_axes();
         return;
     }
@@ -331,6 +330,18 @@ static void retrieve_ctrl_data(EmuEnvState &emuenv, int port, bool is_v2, bool n
         for (const auto &[_, controller] : state.controllers) {
             apply_controller(emuenv, &buttons, axes.data(), controller.controller.get(), is_v2);
         }
+    }
+
+    if (state.ignore_input) {
+        constexpr uint32_t face_mask = SCE_CTRL_CROSS | SCE_CTRL_CIRCLE | SCE_CTRL_TRIANGLE
+            | SCE_CTRL_SQUARE | SCE_CTRL_START | SCE_CTRL_SELECT;
+        if (buttons & face_mask) {
+            buttons = 0;
+            axes.fill(0);
+            reset_axes();
+            return;
+        }
+        state.ignore_input = false;
     }
 
     reset_axes();

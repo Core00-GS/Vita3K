@@ -37,6 +37,7 @@ enum class AppRunType {
 
 void init_paths(Root &root_paths);
 bool init(EmuEnvState &state, Config &cfg, const Root &root_paths);
+void deinit(EmuEnvState &state);
 bool late_init(EmuEnvState &state);
 void apply_renderer_config(EmuEnvState &emuenv);
 void set_current_config(EmuEnvState &emuenv, const std::string &app_path);

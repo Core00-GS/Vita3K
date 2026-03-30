@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <renderer/gl/overlay_renderer.h>
 #include <renderer/gl/screen_render.h>
 #include <renderer/gl/surface_cache.h>
 #include <renderer/state.h>
@@ -24,7 +25,9 @@
 
 #include "types.h"
 
+#include <chrono>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace renderer::gl {
@@ -37,11 +40,16 @@ struct GLState : public renderer::State {
     GLSurfaceCache surface_cache;
 
     ScreenRenderer screen_renderer;
+    OverlayRenderer overlay_renderer;
+
+    std::unordered_set<GLContext *> live_contexts;
+    std::unordered_set<GLRenderTarget *> live_render_targets;
 
     int client_width() const;
     int client_height() const;
 
     bool init() override;
+    void cleanup() override;
     void late_init(const Config &cfg, const std::string_view game_id, MemState &mem) override;
 
     TextureCache *get_texture_cache() override {

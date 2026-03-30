@@ -23,15 +23,23 @@
 #include <threads/queue.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
+struct DialogState;
 struct DisplayState;
 struct GxmState;
 struct Config;
+
+namespace overlay {
+class display_manager;
+}
 
 enum struct MappingMethod : int {
     Disabled,
@@ -48,7 +56,8 @@ enum struct DisplayProtocol {
     Win32,
     MacOS,
     X11,
-    Wayland
+    Wayland,
+    Android
 };
 
 struct WindowCallbacks {
@@ -59,6 +68,7 @@ struct WindowCallbacks {
     std::function<void()> done_current;
     std::function<int()> client_width;
     std::function<int()> client_height;
+    std::function<std::vector<std::string>()> get_font_dirs;
     void *native_handle = nullptr;
     void *native_display = nullptr;
     DisplayProtocol display_protocol = DisplayProtocol::Unknown;
@@ -79,6 +89,7 @@ struct State {
     fs::path log_path;
     fs::path shared_path;
     fs::path static_assets;
+    fs::path pref_path;
     fs::path shaders_path;
     fs::path shaders_log_path;
 
@@ -116,8 +127,17 @@ struct State {
 
     bool should_display;
 
+    std::atomic<bool> async_flip_requested{ false };
+
     std::unique_ptr<std::thread> render_thread;
-    std::atomic<bool> render_abort{false};
+    std::atomic<bool> render_abort{ false };
+
+    std::vector<ShadersHash> precompile_queue;
+    std::atomic<bool> precompile_requested{ false };
+    std::atomic<bool> precompile_complete{ false };
+    std::atomic<int> precompile_progress{ 0 };
+    int precompile_total = 0;
+    std::string precompile_bg_path;
 
     // only support disabled by default
     int supported_mapping_methods_mask = 1;
@@ -127,7 +147,38 @@ struct State {
     bool is_adreno_stock = false;
     bool is_adreno_turnip = false;
 
+    // Non-owning pointer to the overlay display manager
+    overlay::display_manager *overlay_manager = nullptr;
+    bool show_compile_shaders = true;
+
+    uint32_t m_shaders_compiled_count = 0;
+    std::chrono::steady_clock::time_point m_shaders_compiled_time{};
+
+    std::atomic<bool> paused{ false };
+
+    // Non-owning pointer to dialog state for native common dialog overlays.
+    DialogState *common_dialog = nullptr;
+    int sys_date_format = 0;
+    int sys_lang = 0;
+
+    bool performance_overlay = false;
+    int performance_overlay_position = 0;
+    int performance_overlay_detail = 0;
+
+    uint32_t perf_fps = 0;
+    uint32_t perf_avg_fps = 0;
+    uint32_t perf_min_fps = 0;
+    uint32_t perf_max_fps = 0;
+    uint32_t perf_ms_per_frame = 0;
+    float perf_fps_values[20] = {};
+    uint32_t perf_fps_values_count = 0;
+    uint32_t perf_current_fps_offset = 0;
+
+    void update_overlays();
+    void init_overlay_font_dirs();
+
     virtual bool init() = 0;
+    virtual void cleanup() {};
     virtual void late_init(const Config &cfg, const std::string_view game_id, MemState &mem) = 0;
 
     virtual TextureCache *get_texture_cache() = 0;
@@ -165,10 +216,10 @@ struct State {
         return true;
     }
     virtual void unmap_memory(MemState &mem, Ptr<void> address) {}
+#ifdef __ANDROID__
     virtual std::vector<std::string> get_gpu_list() {
         return { "Automatic" };
     }
-#ifdef __ANDROID__
     virtual bool support_custom_drivers() {
         return false;
     }
@@ -194,6 +245,7 @@ struct State {
         log_path = root_paths.get_log_path();
         shared_path = root_paths.get_shared_path();
         static_assets = root_paths.get_static_assets_path();
+        pref_path = root_paths.get_pref_path();
     }
 
     void set_app(const char *title_id, const char *self_name) {

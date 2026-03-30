@@ -35,9 +35,11 @@
 #include <ngs/state.h>
 #include <nids/types.h>
 #include <np/state.h>
+#include <overlay/display_manager.h>
 #include <packages/license.h>
 #include <packages/sfo.h>
 #include <regmgr/state.h>
+#include <renderer/functions.h>
 #include <renderer/state.h>
 #include <touch/state.h>
 

@@ -37,6 +37,7 @@ extern "C" void *get_metal_layer_from_view(void *nsview);
 #ifdef __ANDROID__
 #include <SDL3/SDL.h>
 #include <jni.h>
+#include <vulkan/vulkan_android.h>
 
 static bool has_surface = false;
 
@@ -77,8 +78,11 @@ bool ScreenRenderer::create() {
         this->surface = state.instance.createMetalSurfaceEXT(create_info);
     }
 #elif defined(__ANDROID__)
-    LOG_ERROR("No android yet (ever).");
-    return false;
+    {
+        vk::AndroidSurfaceCreateInfoKHR create_info{};
+        create_info.window = static_cast<ANativeWindow *>(state.window_callbacks.native_handle);
+        this->surface = state.instance.createAndroidSurfaceKHR(create_info);
+    }
 #else
     switch (state.window_callbacks.display_protocol) {
 #if defined(HAVE_X11)
@@ -276,7 +280,7 @@ void ScreenRenderer::create_swapchain() {
             // if the swapchain size increased, we need to reset the filter
             std::string filter_name{ filter->get_name() };
             filter.reset();
-            set_filter(filter_name);
+            apply_filter(filter_name);
         } else {
             filter->on_resize();
         }
@@ -302,15 +306,38 @@ void ScreenRenderer::destroy_swapchain() {
 
 void ScreenRenderer::cleanup() {
     state.device.waitIdle();
+
+    filter.reset();
+
+    for (auto &img : vita_surface)
+        img.destroy();
+    vita_surface.clear();
+
+    if (vita_surface_staging) {
+        state.allocator.destroyBuffer(vita_surface_staging, vita_surface_staging_alloc);
+        vita_surface_staging = nullptr;
+    }
+
     for (vk::Framebuffer fb : swapchain_framebuffers)
         state.device.destroy(fb);
+    swapchain_framebuffers.clear();
 
     state.device.destroy(default_render_pass);
+    default_render_pass = nullptr;
     state.device.destroy(post_filter_render_pass);
+    post_filter_render_pass = nullptr;
+
+#ifdef __ANDROID__
+    state.device.destroy(stock_adreno_pass);
+    stock_adreno_pass = nullptr;
+#endif
 
     for (vk::ImageView view : swapchain_views)
         state.device.destroy(view);
+    swapchain_views.clear();
+
     state.device.destroy(swapchain);
+    swapchain = nullptr;
 
     for (uint32_t i = 0; i <= swapchain_size; i++) {
         if (i != swapchain_size)
@@ -319,17 +346,25 @@ void ScreenRenderer::cleanup() {
         state.device.destroy(image_acquired_semaphores[i]);
         state.device.destroy(image_ready_semaphores[i]);
     }
+    fences.clear();
+    image_acquired_semaphores.clear();
+    image_ready_semaphores.clear();
+
+    command_buffers.clear();
 
     state.instance.destroy(surface);
+    surface = nullptr;
 }
 
 static constexpr uint64_t next_image_timeout = std::numeric_limits<uint64_t>::max();
 
-bool ScreenRenderer::acquire_swapchain_image(bool start_render_pass) {
+bool ScreenRenderer::acquire_swapchain_image() {
     if (!has_surface) {
         swapchain_image_idx = 0xDEADBEAF;
         return false;
     }
+
+    apply_pending_filter();
 
     vk::Result acquire_result = vk::Result::eErrorOutOfDateKHR;
 
@@ -387,22 +422,22 @@ bool ScreenRenderer::acquire_swapchain_image(bool start_render_pass) {
         current_cmd_buffer.begin(begin_info);
     }
 
-    if (start_render_pass) {
-        vk::RenderPassBeginInfo pass_info{
-            .renderPass = default_render_pass,
-            .framebuffer = swapchain_framebuffers[swapchain_image_idx],
-            .renderArea = {
-                .offset = { 0, 0 },
-                .extent = extent }
-        };
-        vk::ClearValue clear_color{
-            .color = { std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f } }
-        };
-        pass_info.setClearValues(clear_color);
-        current_cmd_buffer.beginRenderPass(pass_info, vk::SubpassContents::eInline);
-    }
-
     return true;
+}
+
+void ScreenRenderer::begin_default_render_pass() {
+    vk::RenderPassBeginInfo pass_info{
+        .renderPass = default_render_pass,
+        .framebuffer = swapchain_framebuffers[swapchain_image_idx],
+        .renderArea = {
+            .offset = { 0, 0 },
+            .extent = extent }
+    };
+    vk::ClearValue clear_color{
+        .color = { std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 1.0f } }
+    };
+    pass_info.setClearValues(clear_color);
+    current_cmd_buffer.beginRenderPass(pass_info, vk::SubpassContents::eInline);
 }
 
 void ScreenRenderer::render(vk::ImageView image_view, vk::ImageLayout layout, const Viewport &viewport) {
@@ -497,18 +532,37 @@ void ScreenRenderer::swap_window() {
 }
 
 void ScreenRenderer::set_filter(const std::string_view &filter) {
-    if (this->filter && filter == this->filter->get_name())
-        // we are already using this filter
+    std::lock_guard lock(pending_filter_mutex);
+    pending_filter_name = filter;
+    has_pending_filter.store(true, std::memory_order_release);
+}
+
+void ScreenRenderer::apply_pending_filter() {
+    if (!has_pending_filter.load(std::memory_order_acquire))
+        return;
+
+    std::string name;
+    {
+        std::lock_guard lock(pending_filter_mutex);
+        name = std::move(pending_filter_name);
+        has_pending_filter.store(false, std::memory_order_release);
+    }
+
+    apply_filter(name);
+}
+
+void ScreenRenderer::apply_filter(const std::string_view &name) {
+    if (this->filter && name == this->filter->get_name())
         return;
 
     this->filter.reset();
-    if (filter == "FSR")
+    if (name == "FSR")
         this->filter = std::make_unique<FSRScreenFilter>(*this);
-    else if (filter == "FXAA")
+    else if (name == "FXAA")
         this->filter = std::make_unique<FXAAScreenFilter>(*this);
-    else if (filter == "Bicubic")
+    else if (name == "Bicubic")
         this->filter = std::make_unique<BicubicScreenFilter>(*this);
-    else if (filter == "Nearest")
+    else if (name == "Nearest")
         this->filter = std::make_unique<NearestScreenFilter>(*this);
     else
         this->filter = std::make_unique<BilinearScreenFilter>(*this);

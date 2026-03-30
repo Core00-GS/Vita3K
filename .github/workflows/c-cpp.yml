@@ -2,9 +2,13 @@ name: C/C++ CI
 
 on:
   push:
+    branches:
+      - qt
     paths-ignore:
       - '**/*.md'
   pull_request:
+    branches:
+      - qt
     paths-ignore:
       - '**/*.md'
 
@@ -51,13 +55,10 @@ jobs:
             cmake_preset: windows-ninja
 
           - os: windows-11-arm
-            arch: arm64
-            cache_path: |
-              C:\vcpkg\installed
-              C:\vcpkg\packages
-            vcpkg_triplet: arm64-windows-static-md
-            extra_cmake_args: -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake -DVCPKG_TARGET_TRIPLET=arm64-windows-static-md
-            cmake_preset: windows-ninja-clang
+            arch: aarch64
+            cache_path: C:\msys2-ccache
+            msys2_env: clangarm64
+            cmake_preset: windows-msys2
 
           - os: macos-intel
             runs_on: macos-latest
@@ -70,13 +71,6 @@ jobs:
             cache_path: ~/Library/Caches/ccache
             extra_cmake_args: -DCMAKE_OSX_ARCHITECTURES="arm64" -DFORCE_BUILD_OPENSSL_MAC=ON -DVITA3K_FORCE_CUSTOM_BOOST=ON
             cmake_preset: macos-ninja
-
-          - os: android
-            runs_on: ubuntu-latest
-            cache_path: |
-              /usr/local/share/vcpkg/installed
-              /usr/local/share/vcpkg/packages
-            vcpkg_triplet: arm64-android
 
     steps:
       - uses: actions/checkout@v6
@@ -112,61 +106,89 @@ jobs:
           curl -sLO https://github.com/linuxdeploy/linuxdeploy/releases/latest/download/linuxdeploy-${{ matrix.arch }}.AppImage
           sudo cp -f linuxdeploy-${{ matrix.arch }}.AppImage /usr/local/bin/
           sudo chmod +x /usr/local/bin/linuxdeploy-${{ matrix.arch }}.AppImage
+
+          # Set up linuxdeploy-plugin-qt for Qt bundling in AppImage
+          curl -sLO https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/latest/download/linuxdeploy-plugin-qt-${{ matrix.arch }}.AppImage
+          sudo cp -f linuxdeploy-plugin-qt-${{ matrix.arch }}.AppImage /usr/local/bin/
+          sudo chmod +x /usr/local/bin/linuxdeploy-plugin-qt-${{ matrix.arch }}.AppImage
         if: startsWith(matrix.os, 'ubuntu')
 
       - name: Set up build environment (Windows)
         run: |
           vcpkg install zlib boost-system boost-filesystem boost-program-options boost-icl boost-variant curl openssl --triplet=${{ matrix.vcpkg_triplet }}
-        if: startsWith(matrix.os, 'windows')
+        if: startsWith(matrix.os, 'windows') && !matrix.msys2_env
 
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: ${{ matrix.arch }}
-        if: startsWith(matrix.os, 'windows')
-
-      - name: Set up build environment (Android)
-        run: |
-          sudo apt-get install -y ninja-build
-          vcpkg install boost-system boost-filesystem boost-program-options boost-icl boost-variant openssl zlib --triplet=${{ matrix.vcpkg_triplet }}
-        if: matrix.os == 'android'
-
-      - uses: hendrikmuhs/ccache-action@v1.2
-        if: matrix.os == 'android'
+        if: startsWith(matrix.os, 'windows') && !matrix.msys2_env
 
       - uses: mozilla-actions/sccache-action@v0.0.9
-        if: startsWith(matrix.os, 'windows') || startsWith(matrix.os, 'ubuntu')
+        if: (startsWith(matrix.os, 'windows') && !matrix.msys2_env) || startsWith(matrix.os, 'ubuntu')
         with:
           disable_annotations: true
 
-      - name: Restore Gradle Cache
-        uses: actions/cache@v5
+      - name: Set up MSYS2 (Windows ARM)
+        uses: msys2/setup-msys2@v2
         with:
-          path: '~/.gradle/'
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/build.gradle') }}-${{ hashFiles('android/**/*.xml') }}-${{ hashFiles('android/**.java') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-${{ hashFiles('**/build.gradle') }}-${{ hashFiles('android/**/*.xml') }}-
-            ${{ runner.os }}-gradle-${{ hashFiles('**/build.gradle') }}-
-            ${{ runner.os }}-gradle-
-        if: matrix.os == 'android'
-
-      - name: Decode Android keystore
-        env:
-          KEYSTORE_ENCODED: ${{ secrets.KEYSTORE }}
-        run: |
-          if [ -n "$KEYSTORE_ENCODED" ]; then
-            echo "$KEYSTORE_ENCODED" | base64 --decode > /home/runner/keystore.jks
-          fi
-        if: matrix.os == 'android'
+          msystem: clangarm64
+          update: true
+          cache: true
+          install: |
+            mingw-w64-clang-aarch64-clang
+            mingw-w64-clang-aarch64-ccache
+            mingw-w64-clang-aarch64-cmake
+            mingw-w64-clang-aarch64-lld
+            mingw-w64-clang-aarch64-ninja
+            mingw-w64-clang-aarch64-boost
+            mingw-w64-clang-aarch64-openssl
+            mingw-w64-clang-aarch64-curl
+            mingw-w64-clang-aarch64-zlib
+            mingw-w64-clang-aarch64-qt6-base
+            mingw-w64-clang-aarch64-qt6-svg
+            mingw-w64-clang-aarch64-qt6-tools
+            git
+        if: matrix.msys2_env
 
       - name: Reset ccache statistics
         run: ccache -z
         if: startsWith(matrix.os, 'macos')
 
+      - name: Install Qt6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.2'
+          cache: true
+        if: "!matrix.msys2_env"
+
       - name: Build Vita3K
         run: |
           cmake ${{ matrix.extra_cmake_args }} --preset ${{ matrix.cmake_preset }}
           cmake --build build/${{ matrix.cmake_preset }} --config ${{ env.BUILD_CONFIG }}
-        if: matrix.os != 'android'
+        if: "!matrix.msys2_env"
+
+      - name: Build Vita3K (MSYS2)
+        shell: msys2 {0}
+        run: |
+          export CCACHE_DIR=$(cygpath -u "C:/msys2-ccache")
+          cmake -G "Ninja Multi-Config" -B build/${{ matrix.cmake_preset }} \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build build/${{ matrix.cmake_preset }} --config ${{ env.BUILD_CONFIG }}
+        if: matrix.msys2_env
+
+      - name: Deploy MSYS2 runtime libraries
+        shell: msys2 {0}
+        run: |
+          BINDIR="build/${{ matrix.cmake_preset }}/bin/${{ env.BUILD_CONFIG }}"
+          for dll in libc++.dll libunwind.dll; do
+            if [ -f "/clangarm64/bin/$dll" ]; then
+              cp "/clangarm64/bin/$dll" "$BINDIR/"
+            fi
+          done
+        if: matrix.msys2_env
 
       - name: Print ccache statistics
         run: ccache -s
@@ -174,34 +196,12 @@ jobs:
 
       - name: Print sccache statistics
         run: sccache --show-stats
-        if: startsWith(matrix.os, 'windows') || startsWith(matrix.os, 'ubuntu')
-
-      - name: Build Vita3K (Android)
-        env:
-          SIGNING_STORE_PATH: "/home/runner/keystore.jks"
-          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
-          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
-          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
-          JVM_OPTS: -Xmx6G
-          VCPKG_ROOT: /usr/local/share/vcpkg
-        run: |
-          cp -r data android/assets
-          cp -r lang android/assets
-          cp -r vita3k/shaders-builtin android/assets
-          export JAVA_HOME=$(echo $JAVA_HOME_17_X64)
-          if [ -e "$SIGNING_STORE_PATH" ]; then
-            BUILD_TYPE=Release
-          else
-            BUILD_TYPE=Reldebug
-          fi
-          ./gradlew --stacktrace --configuration-cache --build-cache --parallel --configure-on-demand assemble${BUILD_TYPE}
-          echo "APK_PATH=android/build/outputs/apk/${BUILD_TYPE,,}/android-${BUILD_TYPE,,}.apk" >> $GITHUB_ENV
-        if: matrix.os == 'android'
+        if: (startsWith(matrix.os, 'windows') && !matrix.msys2_env) || startsWith(matrix.os, 'ubuntu')
 
       - name: Run tests
         working-directory: build/${{ matrix.cmake_preset }}
         run: ctest --build-config ${{ env.BUILD_CONFIG }} --output-on-failure
-        if: matrix.os != 'android'
+        if: "!matrix.msys2_env"
 
       - name: Compute git short SHA
         shell: bash
@@ -236,29 +236,19 @@ jobs:
           path: build/${{ matrix.cmake_preset }}/bin/appimage
         if: startsWith(matrix.os, 'ubuntu')
 
-      - name: Upload artifact (Android apk)
-        uses: actions/upload-artifact@v7
-        with:
-          name: vita3k-${{ env.GIT_SHORT_SHA }}-android
-          path: ${{ env.APK_PATH }}
-        if: matrix.os == 'android'
-
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: vita3k-${{ env.GIT_SHORT_SHA }}-${{ matrix.os }}
           path: build/${{ matrix.cmake_preset }}/bin/${{ env.BUILD_CONFIG }}
-        if: matrix.os != 'android'
 
   create-release:
     needs: [build]
     runs-on: ubuntu-latest
     concurrency:
-      group: create-release
+      group: create-release-qt
       cancel-in-progress: false
-    if: |
-      github.ref == 'refs/heads/master' &&
-      github.repository == 'Vita3K/Vita3K'
+    if: github.ref == 'refs/heads/qt' && github.event_name == 'push'
     steps:
       - uses: actions/checkout@v6
         with:
@@ -270,7 +260,6 @@ jobs:
       - name: Get commit info
         run: |
           echo "GIT_SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-          echo "BUILD_VARIABLE=$(git rev-list --count HEAD)" >> $GITHUB_ENV
           echo "LAST_COMMIT_MESSAGE=$(git log -1 --pretty=format:'%s')" >> $GITHUB_ENV
 
       - name: Get last committer
@@ -284,71 +273,35 @@ jobs:
 
       - name: Prepare artifacts
         run: |
-          mkdir -p artifacts-master artifacts-store
+          mkdir -p artifacts-qt
           files=$(find . -maxdepth 1 -type d -name "vita3k-*")
           for f in $files; do
             dir=$(basename $f)
-            if [[ $dir == *-android ]]; then
-              echo "Processing $dir (Android)"
-              cp $dir/*.apk artifacts-master/android-latest.apk
-              cp $dir/*.apk artifacts-store/vita3k-${{ env.BUILD_VARIABLE }}-${{ env.GIT_SHORT_SHA }}-android.apk
-            elif [[ $dir == *-macos-intel ]]; then
+            if [[ $dir == *-macos-intel ]]; then
               echo "Processing $dir (macOS Intel)"
-              cp $dir/*.dmg artifacts-master/macos-latest.dmg
-              cp $dir/*.dmg artifacts-store/vita3k-${{ env.BUILD_VARIABLE }}-${{ env.GIT_SHORT_SHA }}-macos-intel.dmg
+              cp $dir/*.dmg artifacts-qt/macos-qt-latest.dmg
             elif [[ $dir == *-macos-arm64 ]]; then
               echo "Processing $dir (macOS ARM64)"
-              cp $dir/*.dmg artifacts-master/macos-arm64-latest.dmg
-              cp $dir/*.dmg artifacts-store/vita3k-${{ env.BUILD_VARIABLE }}-${{ env.GIT_SHORT_SHA }}-macos-arm64.dmg
+              cp $dir/*.dmg artifacts-qt/macos-arm64-qt-latest.dmg
             elif [[ $dir == *-ubuntu-latest-appimage ]]; then
               echo "Processing $dir (x86_64 AppImage)"
-              cp $dir/*.AppImage* artifacts-master/
-              cp $dir/*.AppImage* artifacts-store/
+              cp $dir/*.AppImage* artifacts-qt/
             elif [[ $dir == *-ubuntu-24.04-arm-appimage ]]; then
               echo "Processing $dir (ARM64 AppImage)"
-              cp $dir/*.AppImage* artifacts-master/
-              cp $dir/*.AppImage* artifacts-store/
+              cp $dir/*.AppImage* artifacts-qt/
             elif [[ $dir == *-ubuntu-latest ]]; then
               echo "Processing $dir (Ubuntu x86_64)"
-              (cd $dir && zip -r ../artifacts-master/ubuntu-latest.zip *)
-              7z a -mx=9 artifacts-store/vita3k-${{ env.BUILD_VARIABLE }}-${{ env.GIT_SHORT_SHA }}-ubuntu-x86_64.7z $dir
+              (cd $dir && zip -r ../artifacts-qt/ubuntu-qt-latest.zip *)
             elif [[ $dir == *-ubuntu-24.04-arm ]]; then
               echo "Processing $dir (Ubuntu ARM64)"
-              (cd $dir && zip -r ../artifacts-master/ubuntu-aarch64-latest.zip *)
-              7z a -mx=9 artifacts-store/vita3k-${{ env.BUILD_VARIABLE }}-${{ env.GIT_SHORT_SHA }}-ubuntu-aarch64.7z $dir
+              (cd $dir && zip -r ../artifacts-qt/ubuntu-arm64-qt-latest.zip *)
             elif [[ $dir == *-windows-latest ]]; then
               echo "Processing $dir (Windows x86_64)"
-              (cd $dir && zip -r ../artifacts-master/windows-latest.zip *)
-              7z a -mx=9 artifacts-store/vita3k-${{ env.BUILD_VARIABLE }}-${{ env.GIT_SHORT_SHA }}-windows-x86_64.7z $dir
+              (cd $dir && zip -r ../artifacts-qt/windows-qt-latest.zip *)
             elif [[ $dir == *-windows-11-arm ]]; then
               echo "Processing $dir (Windows ARM64)"
-              (cd $dir && zip -r ../artifacts-master/windows-arm64-latest.zip *)
-              7z a -mx=9 artifacts-store/vita3k-${{ env.BUILD_VARIABLE }}-${{ env.GIT_SHORT_SHA }}-windows-arm64.7z $dir
+              (cd $dir && zip -r ../artifacts-qt/windows-arm64-qt-latest.zip *)
             fi
           done
-          echo "=== artifacts-master ==="
-          ls -al artifacts-master/
-          echo "=== artifacts-store ==="
-          ls -al artifacts-store/
-
-      - name: "Upload to store repository"
-        uses: tcnksm/ghr@v0
-        with:
-          tag: ${{ env.BUILD_VARIABLE }}
-          path: artifacts-store/
-          owner: ${{ github.repository_owner }}
-          repository: Vita3K-builds
-          name: "Build: ${{ env.BUILD_VARIABLE }}"
-          body: "Corresponding commit: [${{ env.LAST_COMMIT_MESSAGE }}](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) (${{ env.COMMITTER_NAME }})"
-          token: ${{ secrets.STORE_TOKEN }}
-
-      - name: "Upload to master repository"
-        uses: tcnksm/ghr@v0
-        with:
-          tag: continuous
-          path: artifacts-master/
-          delete: "true"
-          owner: ${{ github.repository_owner }}
-          repository: Vita3K
-          name: "Automatic CI builds"
-          body: "Corresponding commit: ${{ github.sha }}\nVita3K Build: ${{ env.BUILD_VARIABLE }}"
+          echo "=== artifacts-qt ==="
+          ls -al artifacts-qt/

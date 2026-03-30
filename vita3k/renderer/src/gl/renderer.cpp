@@ -30,6 +30,8 @@
 #include <features/state.h>
 #include <gxm/state.h>
 
+#include <overlay/display_manager.h>
+
 #include <gxm/functions.h>
 #include <gxm/types.h>
 #include <util/log.h>
@@ -170,14 +172,11 @@ static void debug_output_callback(GLenum source, GLenum type, GLuint id, GLenum 
 bool create(std::unique_ptr<State> &state, const Config &config) {
     auto &gl_state = dynamic_cast<GLState &>(*state);
 
-#ifdef __ANDROID__
-    gladLoadGLES2Loader((GLADloadproc)SDL_GL_GetProcAddress);
-#else
-    static std::function<void *(const char *)> *s_proc_addr = &gl_state.window_callbacks.get_proc_address;
+    static std::function<void *(const char *)> *s_proc_addr;
+    s_proc_addr = &gl_state.window_callbacks.get_proc_address;
     gladLoadGLLoader([](const char *name) -> void * {
         return (*s_proc_addr)(name);
     });
-#endif
 
     // glad_set_post_callback(after_callback);
     // Detect GPU and features
@@ -244,6 +243,12 @@ bool GLState::init() {
     if (!screen_renderer.init(static_assets)) {
         LOG_ERROR("Failed to initialize screen renderer");
         return false;
+    }
+
+    init_overlay_font_dirs();
+
+    if (!overlay_renderer.init(static_assets, pref_path, window_callbacks, sys_lang)) {
+        LOG_WARN("Failed to initialize overlay renderer, overlays will be disabled");
     }
 
     shader_version = fmt::format("v{}", shader::CURRENT_VERSION);
@@ -662,7 +667,8 @@ void GLState::render_frame(DisplayState &display, const GxmState &gxm, MemState 
         frame = display.next_rendered_frame;
     }
 
-    if (!frame.base)
+    const bool has_overlays = overlay_manager && overlay_manager->has_visible();
+    if (!frame.base && !has_overlays)
         return;
 
     SceFVector2 vp_pos = { 0.0f, 0.0f };
@@ -704,57 +710,67 @@ void GLState::render_frame(DisplayState &display, const GxmState &gxm, MemState 
     display.viewport_w = vp_size.x;
     display.viewport_h = vp_size.y;
 
-    // Check if the surface exists
-    float uvs[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    bool need_uv = true;
+    if (frame.base) {
+        // Check if the surface exists
+        float uvs[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        bool need_uv = true;
 
-    const std::size_t texture_data_size = static_cast<size_t>(frame.pitch) * static_cast<size_t>(frame.image_size.y) * sizeof(uint32_t);
+        const std::size_t texture_data_size = static_cast<size_t>(frame.pitch) * static_cast<size_t>(frame.image_size.y) * sizeof(uint32_t);
 
-    SceFVector2 texture_size;
+        SceFVector2 texture_size;
 
-    uint64_t surface_handle = surface_cache.sourcing_color_surface_for_presentation(
-        frame.base, frame.image_size.x, frame.image_size.y, frame.pitch, uvs, this->res_multiplier, texture_size);
+        uint64_t surface_handle = surface_cache.sourcing_color_surface_for_presentation(
+            frame.base, frame.image_size.x, frame.image_size.y, frame.pitch, uvs, this->res_multiplier, texture_size);
 
-    GLint last_texture = 0;
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_texture);
+        GLint last_texture = 0;
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_texture);
 
-    if (!surface_handle) {
-        // Fallback to a manual upload (likely a black !!!)
-        need_uv = false;
-        glBindTexture(GL_TEXTURE_2D, screen_renderer.get_resident_texture());
+        if (!surface_handle) {
+            // Fallback to a manual upload (likely a black !!!)
+            need_uv = false;
+            glBindTexture(GL_TEXTURE_2D, screen_renderer.get_resident_texture());
 
-        // Maybe a victim of surface locking (early from client GXM) when no frame yet renders!
-        const auto pixels = frame.base.cast<void>().get(mem);
+            // Maybe a victim of surface locking (early from client GXM) when no frame yet renders!
+            const auto pixels = frame.base.cast<void>().get(mem);
 
-        glPixelStorei(GL_UNPACK_ROW_LENGTH, frame.pitch);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, frame.image_size.x, frame.image_size.y, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, frame.pitch);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, frame.image_size.x, frame.image_size.y, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 
-        texture_size.x = static_cast<float>(frame.image_size.x);
-        texture_size.y = static_cast<float>(frame.image_size.y);
+            texture_size.x = static_cast<float>(frame.image_size.x);
+            texture_size.y = static_cast<float>(frame.image_size.y);
 
-        surface_handle = screen_renderer.get_resident_texture();
-    } else {
-        const GLint standard_swizzle[4] = { GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA };
+            surface_handle = screen_renderer.get_resident_texture();
+        } else {
+            const GLint standard_swizzle[4] = { GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA };
 
-        glBindTexture(GL_TEXTURE_2D, surface_handle);
+            glBindTexture(GL_TEXTURE_2D, surface_handle);
 #ifdef __ANDROID__
-        for (int i = 0; i < 4; i++) {
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R + i, standard_swizzle[i]);
-        }
+            for (int i = 0; i < 4; i++) {
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R + i, standard_swizzle[i]);
+            }
 #else
-        glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, standard_swizzle);
+            glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, standard_swizzle);
 #endif
+        }
+
+        glBindTexture(GL_TEXTURE_2D, last_texture);
+
+        screen_renderer.render(vp_pos, vp_size, need_uv ? uvs : nullptr, static_cast<GLuint>(surface_handle), texture_size, default_fbo);
     }
 
-    glBindTexture(GL_TEXTURE_2D, last_texture);
-
-    screen_renderer.render(vp_pos, vp_size, need_uv ? uvs : nullptr, static_cast<GLuint>(surface_handle), texture_size, default_fbo);
+    update_overlays();
+    if (overlay_manager && overlay_manager->has_visible()) {
+        overlay_renderer.render(*overlay_manager,
+            vp_pos.x, vp_pos.y, vp_size.x, vp_size.y,
+            fb_w, fb_h, default_fbo);
+    }
 }
 
 void GLState::swap_window() {
+    set_current();
     if (window_callbacks.swap)
         window_callbacks.swap();
 }
@@ -822,5 +838,45 @@ void GLState::precompile_shader(const ShadersHash &hash) {
 }
 
 void GLState::preclose_action() {}
+
+void GLState::cleanup() {
+    set_current();
+
+    glFinish();
+
+    for (GLContext *ctx : live_contexts)
+        delete ctx;
+    live_contexts.clear();
+    context = nullptr;
+
+    for (GLRenderTarget *rt : live_render_targets)
+        delete rt;
+    live_render_targets.clear();
+
+    program_cache.clear();
+    fragment_shader_cache.clear();
+    vertex_shader_cache.clear();
+
+    texture_cache.cleanup();
+
+    surface_cache.cleanup();
+
+    screen_renderer.destroy();
+
+    overlay_renderer.destroy();
+
+    gxp_ptr_map.clear();
+    shaders_cache_hashs.clear();
+    command_buffer_queue.reset();
+    last_scene_id = 0;
+    shaders_count_compiled = 0;
+    programs_count_pre_compiled = 0;
+    should_display = false;
+    render_abort = false;
+
+    glFinish();
+
+    window_callbacks = {};
+}
 
 } // namespace renderer::gl

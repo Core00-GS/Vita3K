@@ -76,7 +76,9 @@ ExitCode init(const Root &root_paths, bool use_stdout) {
         sinks.push_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());
 #endif
 
+#ifndef __ANDROID__
     sinks.push_back(std::make_shared<callback_sink_mt>());
+#endif
 
     if (add_sink(root_paths.get_log_path() / LOG_FILE_NAME) != Success)
         return InitConfigFailed;

@@ -92,4 +92,6 @@ struct DisplayState {
     std::atomic<bool> predicting = false;
 
     std::atomic<Address> current_sync_object;
+
+    void deinit();
 };

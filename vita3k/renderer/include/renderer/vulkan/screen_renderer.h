@@ -21,7 +21,10 @@
 
 #include "screen_filters.h"
 
+#include <atomic>
 #include <memory>
+#include <mutex>
+#include <string>
 
 namespace renderer::vulkan {
 
@@ -80,12 +83,20 @@ public:
     bool setup();
     void cleanup();
 
-    bool acquire_swapchain_image(bool start_render_pass = false);
+    bool acquire_swapchain_image();
+    void begin_default_render_pass();
     void render(vk::ImageView image_view, vk::ImageLayout layout, const Viewport &viewport);
     void swap_window();
     void set_filter(const std::string_view &filter);
 
 private:
+    std::mutex pending_filter_mutex;
+    std::string pending_filter_name;
+    std::atomic<bool> has_pending_filter{ false };
+
+    void apply_pending_filter();
+    void apply_filter(const std::string_view &name);
+
     void create_render_pass();
     void create_layout_sync();
     void create_swapchain();

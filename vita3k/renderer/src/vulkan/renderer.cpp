@@ -33,6 +33,8 @@
 #include <util/log.h>
 #include <vkutil/vkutil.h>
 
+#include <overlay/display_manager.h>
+
 #ifdef __APPLE__
 #include <MoltenVK/mvk_vulkan.h>
 #endif
@@ -914,6 +916,12 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
     if (!screen_renderer.setup())
         return false;
 
+    init_overlay_font_dirs();
+
+    if (!overlay_renderer.init(*this)) {
+        LOG_WARN("Failed to initialize Vulkan overlay renderer, overlays will be disabled");
+    }
+
     support_fsr &= static_cast<bool>(screen_renderer.surface_capabilities.supportedUsageFlags & vk::ImageUsageFlagBits::eStorage);
 
     return true;
@@ -985,15 +993,97 @@ void VKState::late_init(const Config &cfg, const std::string_view game_id, MemSt
 void VKState::cleanup() {
     device.waitIdle();
 
+    request_queue.abort();
+
+    for (VKContext *ctx : live_contexts)
+        delete ctx;
+    live_contexts.clear();
+    context = nullptr;
+
+    for (int i = 0; i < MAX_FRAMES_RENDERING; i++)
+        frames[i].rendered_fences.clear();
+
+    for (VKRenderTarget *rt : live_render_targets)
+        delete rt;
+    live_render_targets.clear();
+
+    pipeline_cache.cleanup();
+
+    for (int i = 0; i < MAX_FRAMES_RENDERING; i++)
+        frames[i].destroy_queue.destroy_objects();
+
     screen_renderer.cleanup();
+
+    overlay_renderer.destroy();
+
+    surface_cache.cleanup();
+
+    texture_cache.cleanup();
+
+    for (auto &[addr, mapping] : mapped_memories) {
+        if (auto *ext = std::get_if<ExternalBuffer>(&mapping.buffer_impl)) {
+            device.destroyBuffer(mapping.buffer);
+            device.freeMemory(ext->memory);
+#ifdef __ANDROID__
+            if (mapping_method == MappingMethod::NativeBuffer && ext->extra) {
+                AHardwareBuffer *hardware_buffer = reinterpret_cast<AHardwareBuffer *>(ext->extra);
+                _AHardwareBuffer_unlock(hardware_buffer, nullptr);
+                if (support_android_buffer_import)
+                    _AHardwareBuffer_release(hardware_buffer);
+            }
+#endif
+        }
+    }
+    mapped_memories.clear();
+    buffer_trapping.trapped_buffers.clear();
+
+    default_image.destroy();
+    default_buffer.destroy();
+
+    for (auto &pool : frame_descriptor_pools)
+        device.destroy(pool);
+    frame_descriptor_pools.clear();
+
+    for (int i = 0; i < MAX_FRAMES_RENDERING; i++) {
+        device.destroy(frames[i].render_pool);
+        frames[i].render_pool = nullptr;
+        device.destroy(frames[i].prerender_pool);
+        frames[i].prerender_pool = nullptr;
+    }
+
+    device.destroy(general_command_pool);
+    general_command_pool = nullptr;
+    device.destroy(transfer_command_pool);
+    transfer_command_pool = nullptr;
+    device.destroy(multithread_command_pool);
+    multithread_command_pool = nullptr;
 
     allocator.destroy();
 
-    device.destroy(general_command_pool);
-    device.destroy(transfer_command_pool);
+    vkutil::deinit();
 
     device.destroy();
+
+    if (debug_messenger) {
+        instance.destroyDebugUtilsMessengerEXT(debug_messenger);
+        debug_messenger = nullptr;
+    }
+    if (debug_report) {
+        instance.destroyDebugReportCallbackEXT(debug_report);
+        debug_report = nullptr;
+    }
+
     instance.destroy();
+
+    gxp_ptr_map.clear();
+    shaders_cache_hashs.clear();
+    request_queue.reset();
+    current_frame_idx = 1;
+    last_scene_id = 0;
+    shaders_count_compiled = 0;
+    programs_count_pre_compiled = 0;
+    should_display = false;
+    render_abort = false;
 }
 
 void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState &mem) {
@@ -1006,7 +1096,15 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState 
         frame = display.next_rendered_frame;
     }
 
-    if (!frame.base)
+    update_overlays();
+    bool has_overlays = false;
+    if (overlay_manager) {
+        overlay_manager->lock_shared();
+        has_overlays = overlay_manager->has_visible();
+        overlay_manager->unlock_shared();
+    }
+
+    if (!frame.base && !has_overlays)
         return;
 
     if (!screen_renderer.acquire_swapchain_image())
@@ -1043,56 +1141,74 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState 
         }
     }
 
-    // Check if the surface exists
-    Viewport viewport;
-    viewport.width = static_cast<uint32_t>(frame.image_size.x * res_multiplier);
-    viewport.height = static_cast<uint32_t>(frame.image_size.y * res_multiplier);
-
-    vk::ImageLayout layout = vk::ImageLayout::eGeneral;
-    vk::ImageView surface_handle = surface_cache.sourcing_color_surface_for_presentation(
-        frame.base, frame.pitch, viewport);
-
-    if (!surface_handle) {
-        vkutil::Image &vita_surface = screen_renderer.vita_surface[screen_renderer.swapchain_image_idx];
-        if (frame.image_size.x != vita_surface.width || frame.image_size.y != vita_surface.height) {
-            // re-create the image
-            vita_surface.destroy();
-            vita_surface = vkutil::Image(frame.image_size.x, frame.image_size.y, vk::Format::eR8G8B8A8Unorm);
-            vita_surface.init_image(vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst);
-        }
-
-        // copy surface to staging buffer
-        const vk::DeviceSize texture_data_size = frame.pitch * frame.image_size.y * 4;
-        memcpy(screen_renderer.vita_surface_staging_info.pMappedData, frame.base.get(mem), texture_data_size);
-
-        // copy staging buffer to image
-        auto &cmd_buffer = screen_renderer.current_cmd_buffer;
-        vita_surface.transition_to_discard(cmd_buffer, vkutil::ImageLayout::TransferDst);
-        vk::BufferImageCopy region{
-            .bufferOffset = 0,
-            .bufferRowLength = frame.pitch,
-            .bufferImageHeight = static_cast<uint32_t>(frame.image_size.y),
-            .imageSubresource = vkutil::color_subresource_layer,
-            .imageOffset = { 0, 0, 0 },
-            .imageExtent = { static_cast<uint32_t>(frame.image_size.x), static_cast<uint32_t>(frame.image_size.y), 1 }
-        };
-        cmd_buffer.copyBufferToImage(screen_renderer.vita_surface_staging, vita_surface.image, vk::ImageLayout::eTransferDstOptimal, region);
-
-        vita_surface.transition_to(cmd_buffer, vkutil::ImageLayout::SampledImage);
-
-        surface_handle = vita_surface.view;
-        viewport = {
-            .offset_x = 0,
-            .offset_y = 0,
-            .width = static_cast<uint32_t>(frame.image_size.x),
-            .height = static_cast<uint32_t>(frame.image_size.y),
-            .texture_width = static_cast<uint32_t>(frame.image_size.x),
-            .texture_height = static_cast<uint32_t>(frame.image_size.y)
-        };
-        layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    if (has_overlays && screen_renderer.current_cmd_buffer) {
+        overlay_renderer.prepare(screen_renderer.current_cmd_buffer,
+            *overlay_manager,
+            display.viewport_w, display.viewport_h);
     }
 
-    screen_renderer.render(surface_handle, layout, viewport);
+    if (frame.base) {
+        // Check if the surface exists
+        Viewport viewport;
+        viewport.width = static_cast<uint32_t>(frame.image_size.x * res_multiplier);
+        viewport.height = static_cast<uint32_t>(frame.image_size.y * res_multiplier);
+
+        vk::ImageLayout layout = vk::ImageLayout::eGeneral;
+        vk::ImageView surface_handle = surface_cache.sourcing_color_surface_for_presentation(
+            frame.base, frame.pitch, viewport);
+
+        if (!surface_handle) {
+            vkutil::Image &vita_surface = screen_renderer.vita_surface[screen_renderer.swapchain_image_idx];
+            if (frame.image_size.x != vita_surface.width || frame.image_size.y != vita_surface.height) {
+                // re-create the image
+                vita_surface.destroy();
+                vita_surface = vkutil::Image(frame.image_size.x, frame.image_size.y, vk::Format::eR8G8B8A8Unorm);
+                vita_surface.init_image(vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst);
+            }
+
+            // copy surface to staging buffer
+            const vk::DeviceSize texture_data_size = frame.pitch * frame.image_size.y * 4;
+            memcpy(screen_renderer.vita_surface_staging_info.pMappedData, frame.base.get(mem), texture_data_size);
+
+            // copy staging buffer to image
+            auto &cmd_buffer = screen_renderer.current_cmd_buffer;
+            vita_surface.transition_to_discard(cmd_buffer, vkutil::ImageLayout::TransferDst);
+            vk::BufferImageCopy region{
+                .bufferOffset = 0,
+                .bufferRowLength = frame.pitch,
+                .bufferImageHeight = static_cast<uint32_t>(frame.image_size.y),
+                .imageSubresource = vkutil::color_subresource_layer,
+                .imageOffset = { 0, 0, 0 },
+                .imageExtent = { static_cast<uint32_t>(frame.image_size.x), static_cast<uint32_t>(frame.image_size.y), 1 }
+            };
+            cmd_buffer.copyBufferToImage(screen_renderer.vita_surface_staging, vita_surface.image, vk::ImageLayout::eTransferDstOptimal, region);
+
+            vita_surface.transition_to(cmd_buffer, vkutil::ImageLayout::SampledImage);
+
+            surface_handle = vita_surface.view;
+            viewport = {
+                .offset_x = 0,
+                .offset_y = 0,
+                .width = static_cast<uint32_t>(frame.image_size.x),
+                .height = static_cast<uint32_t>(frame.image_size.y),
+                .texture_width = static_cast<uint32_t>(frame.image_size.x),
+                .texture_height = static_cast<uint32_t>(frame.image_size.y)
+            };
+            layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+        }
+
+        screen_renderer.render(surface_handle, layout, viewport);
+    } else if (has_overlays) {
+        screen_renderer.begin_default_render_pass();
+    }
+
+    if (has_overlays && screen_renderer.current_cmd_buffer) {
+        overlay_renderer.render(screen_renderer.current_cmd_buffer,
+            screen_renderer.default_render_pass,
+            screen_renderer.extent,
+            display.viewport_x, display.viewport_y,
+            display.viewport_w, display.viewport_h);
+    }
 }
 
 void VKState::swap_window() {
@@ -1497,18 +1613,6 @@ std::vector<std::string> VKState::get_gpu_list() {
 
     return gpu_list;
 }
-#else
-std::vector<std::string> VKState::get_gpu_list() {
-    const std::vector<vk::PhysicalDevice> gpus = instance.enumeratePhysicalDevices();
-
-    std::vector<std::string> gpu_list;
-    // First value is always automatic
-    gpu_list.emplace_back("Automatic");
-    for (const vk::PhysicalDevice gpu : gpus)
-        gpu_list.emplace_back(gpu.getProperties().deviceName.data());
-
-    return gpu_list;
-}
 #endif
 
 uint32_t VKState::get_gpu_version() {
@@ -1521,51 +1625,116 @@ std::string_view VKState::get_gpu_name() {
 
 } // namespace renderer::vulkan
 
-std::vector<std::string> renderer::enumerate_vulkan_gpu_names() {
-    std::vector<std::string> gpu_list;
-    gpu_list.emplace_back("Automatic");
+renderer::VulkanDeviceInfo renderer::enumerate_vulkan_devices() {
+    VulkanDeviceInfo info;
+    info.gpu_names.emplace_back("Automatic");
 
     try {
-        VULKAN_HPP_DEFAULT_DISPATCHER.init();
+        vk::detail::DispatchLoaderDynamic dispatch;
+        dispatch.init();
 
         vk::ApplicationInfo app_info{
             .apiVersion = VK_API_VERSION_1_0
         };
 
-        std::vector<const char *> extensions;
-#ifdef __APPLE__
-        for (const vk::ExtensionProperties &prop : vk::enumerateInstanceExtensionProperties()) {
-            if (std::string_view(prop.extensionName.data()) == vk::KHRPortabilityEnumerationExtensionName) {
-                extensions.push_back(vk::KHRPortabilityEnumerationExtensionName);
-                break;
+        std::vector<const char *> instance_extensions;
+        bool has_properties2 = false;
+        for (const vk::ExtensionProperties &prop : vk::enumerateInstanceExtensionProperties(nullptr, dispatch)) {
+            const std::string_view name(prop.extensionName.data());
+            if (name == vk::KHRGetPhysicalDeviceProperties2ExtensionName) {
+                instance_extensions.push_back(vk::KHRGetPhysicalDeviceProperties2ExtensionName);
+                has_properties2 = true;
             }
-        }
+#ifdef __APPLE__
+            else if (name == vk::KHRPortabilityEnumerationExtensionName) {
+                instance_extensions.push_back(vk::KHRPortabilityEnumerationExtensionName);
+            }
 #endif
+        }
 
         vk::InstanceCreateInfo instance_info{
 #ifdef __APPLE__
-            .flags = extensions.empty() ? vk::InstanceCreateFlags{} : vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR,
+            .flags = vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR,
 #endif
             .pApplicationInfo = &app_info,
         };
-        instance_info.setPEnabledExtensionNames(extensions);
+        instance_info.setPEnabledExtensionNames(instance_extensions);
 
-        vk::UniqueInstance instance = vk::createInstanceUnique(instance_info);
+        vk::UniqueInstance instance = vk::createInstanceUnique(instance_info, nullptr, dispatch);
+        dispatch.init(instance.get(), dispatch.vkGetInstanceProcAddr);
 
-        VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumeratePhysicalDevices = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
-            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr(instance.get(), "vkEnumeratePhysicalDevices"));
-        VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
-            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr(instance.get(), "vkGetPhysicalDeviceProperties"));
-        VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(
-            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr(instance.get(), "vkDestroyInstance"));
+        std::vector<vk::PhysicalDevice> physical_devices = instance->enumeratePhysicalDevices(dispatch);
 
-        for (const vk::PhysicalDevice &gpu : instance->enumeratePhysicalDevices())
-            gpu_list.emplace_back(gpu.getProperties().deviceName.data());
+        for (const vk::PhysicalDevice &gpu : physical_devices) {
+            info.gpu_names.emplace_back(gpu.getProperties(dispatch).deviceName.data());
+
+            int mask = (1 << static_cast<int>(MappingMethod::Disabled));
+
+#ifndef __APPLE__
+            if (has_properties2) {
+                bool support_buffer_device_address = false;
+                bool support_standard_layout = false;
+                bool support_external_memory = false;
+#ifdef __ANDROID__
+                bool support_android_buffer_import = false;
+                bool support_unix_fd_import = false;
+#endif
+                for (const vk::ExtensionProperties &ext : gpu.enumerateDeviceExtensionProperties(nullptr, dispatch)) {
+                    const std::string_view name(ext.extensionName.data());
+                    if (name == vk::KHRBufferDeviceAddressExtensionName)
+                        support_buffer_device_address = true;
+                    else if (name == vk::KHRUniformBufferStandardLayoutExtensionName)
+                        support_standard_layout = true;
+                    else if (name == vk::EXTExternalMemoryHostExtensionName)
+                        support_external_memory = true;
+#ifdef __ANDROID__
+                    else if (name == VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME)
+                        support_android_buffer_import = true;
+                    else if (name == VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)
+                        support_unix_fd_import = true;
+#endif
+                }
+
+                bool support_memory_mapping = true;
+                if (support_buffer_device_address) {
+                    auto features = gpu.getFeatures2KHR<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceBufferDeviceAddressFeatures>(dispatch);
+                    support_buffer_device_address = static_cast<bool>(features.get<vk::PhysicalDeviceBufferDeviceAddressFeatures>().bufferDeviceAddress);
+                }
+                support_memory_mapping &= support_buffer_device_address;
+
+                if (support_standard_layout) {
+                    auto features = gpu.getFeatures2KHR<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceUniformBufferStandardLayoutFeatures>(dispatch);
+                    support_standard_layout = static_cast<bool>(features.get<vk::PhysicalDeviceUniformBufferStandardLayoutFeatures>().uniformBufferStandardLayout);
+                }
+                support_memory_mapping &= support_standard_layout;
+
+                if (support_memory_mapping) {
+                    mask |= (1 << static_cast<int>(MappingMethod::DoubleBuffer));
+                    mask |= (1 << static_cast<int>(MappingMethod::PageTable));
+
+                    if (support_external_memory) {
+                        auto props = gpu.getProperties2KHR<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>(dispatch);
+                        support_external_memory = (props.get<vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>().minImportedHostPointerAlignment <= 4096);
+                    }
+
+                    if (support_external_memory)
+                        mask |= (1 << static_cast<int>(MappingMethod::ExernalHost));
+
+#ifdef __ANDROID__
+                    if (support_android_buffer_import || support_unix_fd_import)
+                        mask |= (1 << static_cast<int>(MappingMethod::NativeBuffer));
+#endif
+                }
+            }
+#endif // !__APPLE__
+
+            info.mapping_method_masks.push_back(mask);
+        }
     } catch (const std::exception &e) {
-        LOG_WARN("Vulkan GPU enumeration failed: {}", e.what());
+        LOG_WARN("Vulkan device enumeration failed: {}", e.what());
     }
 
-    return gpu_list;
+    return info;
 }
 
 namespace renderer::vulkan {
@@ -1587,10 +1756,9 @@ void VKState::preclose_action() {
     // Stop the GPU request wait thread before destruction begins.
     // VKState (owns the queue) is destroyed before VKContext (owns the thread).
     request_queue.abort();
-    if (context) {
-        VKContext *vk_context = static_cast<VKContext *>(context);
-        if (vk_context->gpu_request_wait_thread.joinable()) {
-            vk_context->gpu_request_wait_thread.join();
+    for (VKContext *ctx : live_contexts) {
+        if (ctx->gpu_request_wait_thread.joinable()) {
+            ctx->gpu_request_wait_thread.join();
         }
     }
 
